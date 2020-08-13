@@ -28,6 +28,13 @@
 #include <errno.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <linux/inet_diag.h>
+#include <linux/sock_diag.h>
+
+#include <netlink/msg.h>
+#include <netlink/netlink.h>
+
 using namespace std::string_literals;
 
 // Convert /proc/net/tcp's mangled big-endian notation to a host-endian int32'
@@ -41,7 +48,57 @@ uint32_t tcpToInt(const std::string &part)
     return result;
 }
 
+int parseInetDiagMesg(struct nl_msg *msg, void *arg) {
+    auto self = static_cast<ConnectionMapping*>(arg);
+    struct nlmsghdr *nlh = nlmsg_hdr(msg);
+    auto inetDiagMsg = static_cast<inet_diag_msg*>(nlmsg_data(nlh));
+    Packet::Address localAddress;
+    // Some applications (like Steam) use ipv6 sockets with ipv4.
+    // This results in ipv4 addresses that end up in the tcp6 file.
+    // They seem to start with 0000000000000000FFFF0000, so if we
+    // detect that, assume it is ipv4-over-ipv6.
+    if (inetDiagMsg->idiag_family == AF_INET ||
+       (inetDiagMsg->id.idiag_src[0] == 0 && inetDiagMsg->id.idiag_src[1] == 0 &&  inetDiagMsg->id.idiag_src[2] == 0xffff0000)) {
+        // I expected to need ntohl calls here and bewlow for src but comparing to values gathered by parsing proc they are not needed
+        localAddress.address[3] = inetDiagMsg->id.idiag_src[0];
+    } else {
+        std::memcpy(localAddress.address.data(), inetDiagMsg->id.idiag_src, sizeof(localAddress.address));
+    }
+    localAddress.port = ntohs(inetDiagMsg->id.idiag_sport);
+    self->m_localToINode[localAddress] = inetDiagMsg->idiag_inode;
+    self->m_inodes.insert(inetDiagMsg->idiag_inode);
+    return NL_OK;
+}
+
+template <typename T>
+// I am lazy
+static void compareMaps(const T& proc, const T& sock_diag)
+{
+    auto  print_array = [](const auto& p) {
+        return std::string() + "[" +  std::to_string(p[0])  + "," +std::to_string(p[1]) + "," +std::to_string(p[2])+ "," +std::to_string(p[3]) + "]";
+    };
+    std::cout << std::boolalpha << (proc == sock_diag) << '\n';
+    for (auto pair : proc) {
+        if (sock_diag.count(pair.first)) {
+            if (sock_diag.at(pair.first) != pair.second) {
+                std::cout << "Mismatch:\n\tproc "
+                << print_array(pair.first.address) << ":" << pair.first.port << " " << pair.second << "\n\tsock_diag "
+                << print_array(pair.first.address) << ":" << pair.first.port << " " << sock_diag.at(pair.first) << "\n";
+            }
+        } else {
+            std::cout << "sock_diag didn't report " << print_array(pair.first.address) << ":" << pair.first.port << " " << pair.second << "\n";
+        }
+    }
+    for (auto pair : sock_diag) {
+        if (!proc.count(pair.first)) {
+            std::cout << "sock diag had additionally " << print_array(pair.first.address) << ":" << pair.first.port << " " << pair.second << "\n";
+        }
+    }
+}
+
+
 ConnectionMapping::ConnectionMapping()
+    : m_socket(nl_socket_alloc(), nl_socket_free)
 {
     m_socketFileMatch =
         // Format of /proc/net/tcp is:
@@ -51,7 +108,9 @@ ConnectionMapping::ConnectionMapping()
         // Since we care only about local address, local port and inode we ignore the middle 70 characters.
         std::regex("\\s*\\d+: (?:(\\w{8})|(\\w{32})):([A-F0-9]{4}) (.{94}|.{70}) (\\d+) .*", std::regex::ECMAScript | std::regex::optimize);
 
-    parseProc();
+    nl_connect(m_socket.get(), NETLINK_SOCK_DIAG);
+    nl_socket_modify_cb(m_socket.get(), NL_CB_VALID, NL_CB_CUSTOM, &parseInetDiagMesg, this);
+    getSocketInfo();
 }
 
 ConnectionMapping::PacketResult ConnectionMapping::pidForPacket(const Packet &packet)
@@ -62,7 +121,7 @@ ConnectionMapping::PacketResult ConnectionMapping::pidForPacket(const Packet &pa
     auto destInode = m_localToINode.find(packet.destinationAddress());
 
     if (sourceInode == m_localToINode.end() && destInode == m_localToINode.end()) {
-        parseProc();
+        getSocketInfo();
 
         sourceInode = m_localToINode.find(packet.sourceAddress());
         destInode = m_localToINode.find(packet.destinationAddress());
@@ -90,29 +149,60 @@ ConnectionMapping::PacketResult ConnectionMapping::pidForPacket(const Packet &pa
     return result;
 }
 
-void ConnectionMapping::parseProc()
-{
-    //TODO: Consider using INET_DIAG netlink protocol for retrieving socket information.
-    if (parseSockets())
-        parsePid();
-}
-
-bool ConnectionMapping::parseSockets()
+void ConnectionMapping::getSocketInfo()
 {
     auto oldInodes = m_inodes;
-
     m_inodes.clear();
     m_localToINode.clear();
+
+    if (!dumpSockets()) {
+        // There was some error with sock_diag
+        parseSockets();
+    } else {
+        parseSockets();
+        compareMaps(m_localToINodeOld, m_localToINode); //Debug
+    }
+    if (m_inodes != oldInodes) {
+        parsePid();
+    }
+}
+
+bool ConnectionMapping::dumpSockets()
+{
+    for (auto family : {AF_INET, AF_INET6}) {
+        for (auto protocol : {IPPROTO_TCP, IPPROTO_UDP}) {
+            if (!dumpSockets(family, protocol)) {
+                std::cout << "error dumping " << family << ' '<<  protocol << "\n";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool ConnectionMapping::dumpSockets(int inet_family, int protocol)
+{
+    inet_diag_req_v2 inet_request;
+    inet_request.id = {};
+    inet_request.sdiag_family = inet_family;
+    inet_request.sdiag_protocol = protocol;
+    inet_request.idiag_states = -1;
+    if (nl_send_simple(m_socket.get(), SOCK_DIAG_BY_FAMILY, NLM_F_DUMP | NLM_F_REQUEST, &inet_request, sizeof(inet_diag_req_v2)) < 0) {
+        return false;
+    }
+    if (nl_recvmsgs_default(m_socket.get()) != 0) {
+        return false;
+    }
+    return true;
+}
+
+
+void ConnectionMapping::parseSockets()
+{
     parseSocketFile("/proc/net/tcp");
     parseSocketFile("/proc/net/udp");
     parseSocketFile("/proc/net/tcp6");
     parseSocketFile("/proc/net/udp6");
-
-    if (m_inodes == oldInodes) {
-        return false;
-    }
-
-    return true;
 }
 
 void ConnectionMapping::parsePid()
@@ -185,7 +275,7 @@ void ConnectionMapping::parseSocketFile(const char *fileName)
 
         localAddress.port = std::stoi(match.str(3), 0, 16);
         auto inode = std::stoi(match.str(5));
-        m_localToINode.insert(std::make_pair(localAddress, inode));
+        m_localToINodeOld.insert(std::make_pair(localAddress, inode));
         m_inodes.insert(inode);
     }
 }
