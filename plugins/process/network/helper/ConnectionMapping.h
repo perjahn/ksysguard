@@ -60,7 +60,6 @@ private:
     std::unordered_set<int> m_inodes;
     std::unordered_set<int> m_pids;
     std::unique_ptr<nl_sock, decltype(&nl_socket_free)> m_socket;
-    std::unordered_map<Packet::Address, int> m_localToINodeOld;
     std::regex m_socketFileMatch;
 
     friend int parseInetDiagMesg(struct nl_msg *msg, void *arg);

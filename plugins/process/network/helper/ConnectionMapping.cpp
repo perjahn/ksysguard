@@ -70,33 +70,6 @@ int parseInetDiagMesg(struct nl_msg *msg, void *arg) {
     return NL_OK;
 }
 
-template <typename T>
-// I am lazy
-static void compareMaps(const T& proc, const T& sock_diag)
-{
-    auto  print_array = [](const auto& p) {
-        return std::string() + "[" +  std::to_string(p[0])  + "," +std::to_string(p[1]) + "," +std::to_string(p[2])+ "," +std::to_string(p[3]) + "]";
-    };
-    std::cout << std::boolalpha << (proc == sock_diag) << '\n';
-    for (auto pair : proc) {
-        if (sock_diag.count(pair.first)) {
-            if (sock_diag.at(pair.first) != pair.second) {
-                std::cout << "Mismatch:\n\tproc "
-                << print_array(pair.first.address) << ":" << pair.first.port << " " << pair.second << "\n\tsock_diag "
-                << print_array(pair.first.address) << ":" << pair.first.port << " " << sock_diag.at(pair.first) << "\n";
-            }
-        } else {
-            std::cout << "sock_diag didn't report " << print_array(pair.first.address) << ":" << pair.first.port << " " << pair.second << "\n";
-        }
-    }
-    for (auto pair : sock_diag) {
-        if (!proc.count(pair.first)) {
-            std::cout << "sock diag had additionally " << print_array(pair.first.address) << ":" << pair.first.port << " " << pair.second << "\n";
-        }
-    }
-}
-
-
 ConnectionMapping::ConnectionMapping()
     : m_socket(nl_socket_alloc(), nl_socket_free)
 {
@@ -158,9 +131,6 @@ void ConnectionMapping::getSocketInfo()
     if (!dumpSockets()) {
         // There was some error with sock_diag
         parseSockets();
-    } else {
-        parseSockets();
-        compareMaps(m_localToINodeOld, m_localToINode); //Debug
     }
     if (m_inodes != oldInodes) {
         parsePid();
@@ -275,7 +245,7 @@ void ConnectionMapping::parseSocketFile(const char *fileName)
 
         localAddress.port = std::stoi(match.str(3), 0, 16);
         auto inode = std::stoi(match.str(5));
-        m_localToINodeOld.insert(std::make_pair(localAddress, inode));
+        m_localToINode.insert(std::make_pair(localAddress, inode));
         m_inodes.insert(inode);
     }
 }
