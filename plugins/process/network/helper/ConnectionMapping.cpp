@@ -1,6 +1,7 @@
 /*
  * This file is part of KSysGuard.
  * Copyright 2019 Arjen Hiemstra <ahiemstra@heimr.nl>
+ * Copyright 2020 David Redondo <kde@david-redondo.de>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
